@@ -2,7 +2,7 @@ CFILES = beep.c
 
 obj-m := beep.o
 gpioModule-objs := $(CFILES:.c=.o)
-ccflags-y += -std=gnu99 -Wall -Wno-declaration-after-statment
+ccflags-y += -std=gnu99 -Wall -Wno-declaration-after-statement
 
 PWD := $(shell pwd)
 
