@@ -1,3 +1,4 @@
+#define DEBUG 1
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -66,7 +67,7 @@ static ssize_t beep_write(struct file *fp, const char __user *buf, size_t count,
     get_user(outValue, &buf[0]);
     if (outValue=='0' || outValue=='1') {
         gpiod_set_value(bdev->gpio , outValue - '0');
-        if ( outValue == '1' ) {
+        if ( outValue == '1' && bdev->ringing_time_jiffies > 0) {
             expires = jiffies + bdev->ringing_time_jiffies;
             result = mod_timer(&bdev->ringing_timer, expires);
             pr_devel("%s: timer_start!(%lu jiffies)(active=%d)\n", __func__, expires, result);
@@ -74,7 +75,7 @@ static ssize_t beep_write(struct file *fp, const char __user *buf, size_t count,
 
         pr_devel("%s: writed [%c] \n", __func__, outValue);
     } else {
-        printk(KERN_INFO "%s: no writed. arg=\"%c\"\n", __func__ , outValue);
+        pr_info("%s: no writed. arg=\"%c\"\n", __func__ , outValue);
     }
 
     return count;
@@ -89,6 +90,16 @@ void beep_off_when_timeup(struct timer_list *timer) {
     gpiod_set_value(bdev->gpio, 0);
 }
 
+static long beep_ioctl(struct file *fp, unsigned int cmd, unsigned long palm) {
+    // cmd=1のみ有効。palmの値でringing_time_jiffiesを更新する。
+    if (cmd == 1) {
+        struct beep_device_info *bdev = fp->private_data;
+        bdev->ringing_time_jiffies = msecs_to_jiffies((unsigned int)palm);
+        pr_devel("%s: 鳴動時間変更(jiffies=%ld)(msec=%d)\n",
+                __func__, bdev->ringing_time_jiffies, (unsigned int)palm); 
+    }
+    return 0;
+}
 
 /* ハンドラ　テーブル */
 struct file_operations beep_fops = {
@@ -96,8 +107,11 @@ struct file_operations beep_fops = {
     .release  = beep_close,
     .read     = beep_read,
     .write    = beep_write,
+    .unlocked_ioctl = beep_ioctl,
+    .compat_ioctl = beep_ioctl,
 };
 
+// キャラクタデバイスの登録と、/dev/beep0の生成
 static int make_udev(struct beep_device_info *bdev, const char* name) { 
     int ret = 0;
     dev_t dev;
@@ -105,7 +119,7 @@ static int make_udev(struct beep_device_info *bdev, const char* name) {
     /* メジャー番号取得 */
     ret = alloc_chrdev_region(&dev, MINOR_BASE, MINOR_NUM, name);
     if (ret != 0) {
-        printk(KERN_ALERT "%s: メジャー番号取得失敗(%d)\n", __func__, ret);
+        pr_alert("%s: メジャー番号取得失敗(%d)\n", __func__, ret);
         goto err;
     }
     bdev->major = MAJOR(dev);
@@ -115,7 +129,7 @@ static int make_udev(struct beep_device_info *bdev, const char* name) {
     bdev->cdev.owner = THIS_MODULE;
     ret = cdev_add(&bdev->cdev, dev, MINOR_NUM);
     if (ret != 0) {
-        printk(KERN_ALERT "%s: キャラクタデバイス登録失敗(%d)\n", __func__, ret);
+        pr_alert("%s: キャラクタデバイス登録失敗(%d)\n", __func__, ret);
         goto err_cdev_add;
     }
 
@@ -142,6 +156,7 @@ err:
     return ret;
 }
 
+// キャラクタデバイス及び/dev/beep0の登録解除
 static void remove_udev(struct beep_device_info *bdev) {
     dev_t dev = MKDEV(bdev->major, MINOR_BASE);
     for (int minor=MINOR_BASE; minor<MINOR_BASE+MINOR_NUM; minor++) {
@@ -153,6 +168,66 @@ static void remove_udev(struct beep_device_info *bdev) {
     unregister_chrdev_region(dev, MINOR_NUM); /* メジャー番号除去 */
 }
 
+// sysfs ringing_timeの読み込みと書き込み
+static ssize_t read_beep_ringing_time(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct beep_device_info *bdev = dev_get_drvdata(dev);
+    if (!bdev) {
+        pr_err("%s: デバイス情報の取得に失敗しました。\n", __func__);
+        return -EFAULT;
+    }
+    return snprintf(buf, PAGE_SIZE, "%d\n", jiffies_to_msecs(bdev->ringing_time_jiffies));
+}
+
+#define MAX_LENGTH_LONG_NUM 11 // unsigned longの最大値　4,294,967,295
+static ssize_t write_beep_ringing_time(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct beep_device_info *bdev;
+    char source[MAX_LENGTH_LONG_NUM];
+    unsigned int time_ms;
+    int result;
+
+    bdev = dev_get_drvdata(dev);
+    if (!bdev) {
+        pr_err("%s: デバイス情報の取得に失敗しました。\n", __func__);
+        return -EFAULT;
+    }
+
+    if (count > MAX_LENGTH_LONG_NUM-1) {
+        pr_err("%s: 引数が長過ぎる(length=%d)\n", __func__, count);
+        return -EINVAL;
+    }
+    strncpy(source, buf, count);
+    source[count] = 0;
+    result = kstrtouint(source, 10, &time_ms);
+    if (result) {
+        pr_err("%s: 引数がおかしい(%s)\n",__func__, source);
+        return -EINVAL;
+    }
+
+    bdev->ringing_time_jiffies = msecs_to_jiffies(time_ms);
+    pr_devel("%s: ringing_timeをセットしました。(msec=%d)(jiffies=%ld)\n", 
+            __func__, time_ms, bdev->ringing_time_jiffies);
+    return count;
+}
+
+// sysfs(/sys/kernel/beep)の生成
+static struct device_attribute dev_attr_beep_ringing_time = {
+    .attr = {
+        .name = "beep_ringing_time",
+        .mode = S_IRUGO | S_IWUGO,
+    },
+    .show = read_beep_ringing_time,
+    .store = write_beep_ringing_time,
+};
+
+static int make_sysfs(struct device *dev) {
+    return device_create_file(dev, &dev_attr_beep_ringing_time);
+}
+
+static void remove_sysfs(struct device *dev) {
+    device_remove_file(dev, &dev_attr_beep_ringing_time);
+}
+
+// ドライバの初期化　及び　後始末
 static const struct of_device_id of_beep_ids[] = {
     { .compatible = "crowpi2-beep" } ,
     { },
@@ -166,44 +241,61 @@ static int beep_probe(struct platform_device *p_dev) {
     int result;
 
     if (!dev->of_node) {
-        printk(KERN_ERR "%s:Not Exist of_node for BEEP DRIVER. Check DTB\n", __func__);
-        return -ENODEV;
+        pr_alert("%s:Not Exist of_node for BEEP DRIVER. Check DTB\n", __func__);
+        result = -ENODEV;
+        goto err;
     }
 
     // デバイス情報のメモリ確保と初期化
     bdev = (struct beep_device_info*)devm_kzalloc(dev, sizeof(struct beep_device_info), GFP_KERNEL);
     if (!bdev) {
         pr_alert("%s: デバイス情報メモリ確保失敗\n", __func__);
-        return -ENOMEM;
+        result = -ENOMEM;
+        goto err;
     }
     dev_set_drvdata(dev, bdev);
 
     // gpioの確保と初期化
     bdev->gpio = devm_gpiod_get(dev, NULL, GPIOD_OUT_LOW);
     if (IS_ERR(bdev->gpio)) {
-        result = PTR_ERR(bdev->gpio);
-        printk(KERN_ERR "%s: can not get GPIO.ERR(%d)\n", __func__, result);
-        return -EIO;
+        result = -PTR_ERR(bdev->gpio);
+        pr_alert("%s: can not get GPIO.ERR(%d)\n", __func__, result);
+        goto err;
     }
 
     // udevの生成
     result = make_udev(bdev, p_dev->name);
     if (result != 0) {
-        printk(KERN_ALERT "%s:Fail make udev. gpio desc dispose!!!\n", __func__);
-        gpiod_put(bdev->gpio);
+        pr_alert("%s:Fail make udev. gpio desc dispose!!!\n", __func__);
+        goto err_udev;
+    }
+
+    // sysfsの生成
+    result = make_sysfs(dev);
+    if (result != 0) {
+        pr_alert("%s: sysfs生成失敗\n", __func__);
+        goto err_sysfs;
     }
     
     // timerの生成
     timer_setup(&bdev->ringing_timer, beep_off_when_timeup, 0);
     bdev->ringing_time_jiffies = msecs_to_jiffies(3000);
 
-    printk(KERN_INFO "%s:beep driver init\n",__func__);
+    pr_info("%s:beep driver init\n",__func__);
+    return 0;
+
+err_sysfs:
+    remove_udev(bdev);
+err_udev:
+    gpiod_put(bdev->gpio);
+err:
     return result;
 }
 
 static int beep_remove(struct platform_device *p_dev) {
     struct beep_device_info *bdev = dev_get_drvdata(&p_dev->dev);
     remove_udev(bdev);
+    remove_sysfs(&p_dev->dev);
 
     // gpioデバイスの開放
     if (bdev->gpio) {
@@ -212,7 +304,7 @@ static int beep_remove(struct platform_device *p_dev) {
 
     del_timer(&bdev->ringing_timer);
 
-    printk(KERN_INFO "%s:beep driver unloaded\n",__func__);
+    pr_info("%s:beep driver unloaded\n",__func__);
     return 0;
 } 
             
