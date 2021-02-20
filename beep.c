@@ -50,11 +50,16 @@ static int beep_close(struct inode *inode, struct file *file) {
 
 static ssize_t beep_read(struct file *fp, char __user *buf, size_t count, loff_t *f_pos) {
     struct beep_device_info *bdev = fp->private_data;
+    int result;
+
+    if (count == 0) return 0;
+    if (buf == NULL ) return -EFAULT;
     if (!bdev) {
         pr_err("%s:デバイス情報取得失敗\n", __func__);
-        return -EFAULT;
+        return -EBADF;
     }
-    put_user(gpiod_get_value(bdev->gpio)+'0', &buf[0]);
+    result = put_user(gpiod_get_value(bdev->gpio)+'0', &buf[0]);
+    if (result != 0) return result;
     return 1;
 }
 
@@ -64,7 +69,11 @@ static ssize_t beep_write(struct file *fp, const char __user *buf, size_t count,
     unsigned long expires;
     int result;
 
-    get_user(outValue, &buf[0]);
+    if (bdev==NULL) return -EBADF;
+    if (count == 0) return 0;
+    result = get_user(outValue, &buf[0]);
+    if (result != 0) return result;
+    
     if (outValue=='0' || outValue=='1') {
         gpiod_set_value(bdev->gpio , outValue - '0');
         if ( outValue == '1' && bdev->ringing_time_jiffies > 0) {
