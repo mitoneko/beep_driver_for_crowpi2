@@ -1,4 +1,4 @@
-#define DEBUG 1
+//#define DEBUG 1
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -209,7 +209,7 @@ static ssize_t write_beep_ringing_time(struct device *dev, struct device_attribu
     return count;
 }
 
-// sysfs(/sys/kernel/beep)の生成
+// sysfs(/sys/device/platform/beep@0/beep_ringing_time)の生成
 static struct device_attribute dev_attr_beep_ringing_time = {
     .attr = {
         .name = "beep_ringing_time",
