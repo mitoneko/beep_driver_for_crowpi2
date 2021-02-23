@@ -8,3 +8,4 @@
 *.dtbo
 *.ko
 dtc
+make_crowpi
