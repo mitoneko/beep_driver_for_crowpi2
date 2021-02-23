@@ -6,4 +6,5 @@
 *.mod
 *.order
 *.dtbo
+*.ko
 dtc
